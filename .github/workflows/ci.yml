@@ -18,7 +18,7 @@ jobs:
       - name: Syntax check
         run: |
           python -m py_compile gateway.py test_gateway.py
-          node --check cloudflare/src/index.js
+          node --check cloudflare/src/index_v2.js
       - name: Security tests
         run: python -m unittest -v
       - name: Cloudflare smoke tests
