@@ -1,5 +1,5 @@
 name = "harness-gateway"
-main = "src/index.js"
+main = "src/index_v2.js"
 compatibility_date = "2026-09-06"
 
 [durable_objects]
@@ -14,3 +14,4 @@ new_sqlite_classes = ["GatewayDO"]
 [vars]
 # Set secrets with `wrangler secret put`; never commit secret values.
 REPO_ALLOWLIST = "yanhul/AIOS,yanhul/try,yanhul/android-ai-assistant,yanhul/RX50"
+# Set AUTHORIZED_SMS_SENDERS as a secret; fail closed if unset.
