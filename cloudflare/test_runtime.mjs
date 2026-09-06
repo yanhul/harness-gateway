@@ -72,7 +72,7 @@ test('runtime: adversarial boundaries reject spoofing, sender mismatch, binding 
   assert.equal(bad.status,401);
   const first=await signedWebhook(gw,wr); const created=await first.json();
   const sua=await sms(gw,`SUA ${created.ticket} ${created.nonce}`); const auth=await sua.json(); assert.equal(auth.status,'AUTHORIZED');
-  assert.equal((await sms(gw,`SUA ${created.ticket} ${created.nonce}`)).status,409);
+  assert.equal((await sms(gw,`SUA ${created.ticket} ${created.nonce}`)).status,403);
   assert.equal((await sms(gw,`SUA ${created.ticket} ${created.nonce}`,'+84000000000')).status,403);
 
   const binding={ticket:created.ticket,repo:wr.repository.full_name,head_sha:wr.workflow_run.head_sha,governance_digest:wr.governance_digest};
@@ -80,7 +80,7 @@ test('runtime: adversarial boundaries reject spoofing, sender mismatch, binding 
   const wrong=await gw.consume(workerReq('/repair/consume',{...binding,repo:'wrong/repo',authorization_token:issued.authorization_token})); assert.equal(wrong.status,403);
   const consumeBody={...binding,authorization_token:issued.authorization_token};
   assert.equal((await gw.consume(workerReq('/repair/consume',consumeBody))).status,200);
-  assert.equal((await gw.consume(workerReq('/repair/consume',consumeBody))).status,409);
+  assert.equal((await gw.consume(workerReq('/repair/consume',consumeBody))).status,403);
   assert.equal((await gw.lifecycle(workerReq('/repair/lifecycle',{...consumeBody,status:'PERSISTED'}))).status,409);
   assert.equal(await gw.verifyChain(),true);
 });
