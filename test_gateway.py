@@ -43,6 +43,11 @@ class GatewayTests(unittest.TestCase):
     def test_wrong_nonce_rejected(self):
         t,nonce=self.l.create(self.event())
         with self.assertRaises(PermissionError): self.l.command('+84123456789',f'SUA {t["ticket"]} bad',True,'f'*64)
+    def test_sua_does_not_require_governance_argument(self):
+        t,nonce=self.l.create(self.event())
+        out=self.l.command('+84123456789',f'SUA {t["ticket"]} {nonce}',True)
+        self.assertEqual(out['status'],'AUTHORIZED')
+        self.assertEqual(out['governance_digest'],'f'*64)
     def test_nonce_replay_rejected(self):
         t,nonce=self.l.create(self.event()); self.l.command('+84123456789',f'SUA {t["ticket"]} {nonce}',True,'f'*64)
         with self.assertRaises(PermissionError): self.l.command('+84123456789',f'SUA {t["ticket"]} {nonce}',True,'f'*64)
