@@ -38,12 +38,11 @@ def normalize_workflow_run(payload: dict[str, Any]) -> dict[str, Any]:
     run_url = wr.get("html_url")
     if not isinstance(full_name,str) or not isinstance(workflow,str) or not isinstance(run_url,str):
         raise ValueError("invalid repository/workflow/url")
+    if full_name not in REPOS: raise ValueError("repository not authorized")
     if not isinstance(run_id,int) or run_id <= 0 or not isinstance(sha,str) or not SHA_RE.fullmatch(sha):
         raise ValueError("invalid run identity")
     if not run_url.startswith(f"https://github.com/{full_name}/actions/runs/{run_id}"):
         raise ValueError("invalid run_url")
-    # Governance digest is deliberately supplied by the trusted harness webhook
-    # producer, not invented by this gateway.
     gov = payload.get("governance_digest")
     if not isinstance(gov,str) or not DIGEST_RE.fullmatch(gov):
         raise ValueError("missing governance_digest")
@@ -73,6 +72,10 @@ class Ledger:
           prev_hash TEXT NOT NULL, event_hash TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS governance(ticket TEXT NOT NULL, name TEXT NOT NULL,
           digest TEXT NOT NULL, PRIMARY KEY(ticket,name));
+        CREATE TABLE IF NOT EXISTS repair_authorizations(
+          token_hash TEXT PRIMARY KEY, ticket TEXT UNIQUE NOT NULL, repo TEXT NOT NULL,
+          head_sha TEXT NOT NULL, governance_digest TEXT NOT NULL,
+          issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
         """)
         self.db.commit()
 
@@ -91,7 +94,7 @@ class Ledger:
 
     def create(self, p: dict[str,Any], ttl: int = 900):
         repo, wf, run_id, sha, gov = p.get("repo"), p.get("workflow"), p.get("run_id"), p.get("head_sha"), p.get("governance_digest")
-        if repo not in REPOS or not isinstance(run_id,int) or run_id <= 0 or not isinstance(sha,str) or not SHA_RE.fullmatch(sha): raise ValueError("invalid webhook identity")
+        if repo not in REPOS or not isinstance(wf,str) or not wf.strip() or not isinstance(run_id,int) or run_id <= 0 or not isinstance(sha,str) or not SHA_RE.fullmatch(sha): raise ValueError("invalid webhook identity")
         if p.get("conclusion") not in ("failure","timed_out","cancelled"): raise ValueError("not a repair-triggering failure")
         if not isinstance(gov,str) or not DIGEST_RE.fullmatch(gov): raise ValueError("missing governance_digest")
         run_url=p.get("run_url")
@@ -152,6 +155,25 @@ class Ledger:
         row=self.get(ticket)
         if not row or row["status"] != "AUTHORIZED": raise PermissionError("repair not authorized")
         if row["repo"] != repo or row["head_sha"] != sha or row["governance_digest"] != gov: raise PermissionError("authorization binding mismatch")
+        existing=self.db.execute("SELECT 1 FROM repair_authorizations WHERE ticket=?",(ticket,)).fetchone()
+        if existing: raise PermissionError("repair authorization already issued")
+        raw=secrets.token_urlsafe(32); t=now(); exp=min(row["expires_at"],t+300)
+        self.db.execute("INSERT INTO repair_authorizations VALUES(?,?,?,?,?,?,?,0)",
+                        (digest(raw),ticket,repo,sha,gov,t,exp))
+        self._transition(ticket,"ACTING","repair-worker")
+        self._event(ticket,"REPAIR_AUTH_ISSUED","gateway",{"repo":repo,"head_sha":sha,"expires_at":exp})
+        self.db.commit()
+        return {"ticket":ticket,"repo":repo,"head_sha":sha,"governance_digest":gov,"authorization_token":raw,"expires_at":exp,"effect":"repair"}
+
+    def consume_repair_token(self, raw, ticket, repo, sha, gov):
+        if not isinstance(raw,str) or not raw: raise PermissionError("missing authorization token")
+        row=self.db.execute("SELECT * FROM repair_authorizations WHERE token_hash=?",(digest(raw),)).fetchone()
+        if not row or row["consumed"]: raise PermissionError("invalid or replayed authorization token")
+        if now() > row["expires_at"]: raise PermissionError("authorization token expired")
+        if row["ticket"] != ticket or row["repo"] != repo or row["head_sha"] != sha or row["governance_digest"] != gov: raise PermissionError("authorization binding mismatch")
+        self.db.execute("UPDATE repair_authorizations SET consumed=1 WHERE token_hash=?",(digest(raw),))
+        self._event(ticket,"REPAIR_AUTH_CONSUMED","repair-worker",{"repo":repo,"head_sha":sha})
+        self.db.commit()
         return {"ticket":ticket,"repo":repo,"head_sha":sha,"governance_digest":gov,"effect":"repair"}
 
 
@@ -182,7 +204,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/repair/authorize":
                 token=self.headers.get("X-Repair-Worker-Token",""); expected=os.environ.get("REPAIR_WORKER_TOKEN","")
                 if not expected or not hmac.compare_digest(token,expected): return self._json(401,{"error":"unauthorized"})
-                p=json.loads(body); return self._json(200,self.ledger.repair_token(p["ticket"],p["repo"],p["head_sha"],p["governance_digest"]))
+                p=json.loads(body); raw=p.get("authorization_token")
+                if raw:
+                    return self._json(200,self.ledger.consume_repair_token(raw,p["ticket"],p["repo"],p["head_sha"],p["governance_digest"]))
+                return self._json(200,self.ledger.repair_token(p["ticket"],p["repo"],p["head_sha"],p["governance_digest"]))
             return self._json(404,{"error":"not_found"})
         except (ValueError,PermissionError,KeyError,json.JSONDecodeError) as e: return self._json(400,{"error":str(e)})
 
