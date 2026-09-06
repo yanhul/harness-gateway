@@ -1,0 +1,26 @@
+{
+  "protocol_version": 1,
+  "commands": {
+    "SUA": {"args": ["ticket", "nonce"], "effect": "authorize_repair"},
+    "BOQUA": {"args": ["ticket"], "effect": "reject_repair"},
+    "RETRY": {"args": ["ticket"], "effect": "retry_verify_only"},
+    "STATUS": {"args": [], "effect": "read_status"},
+    "STOP": {"args": [], "effect": "revoke_pending"}
+  },
+  "authorization": {
+    "sender_identity_required": true,
+    "one_time_nonce_required_for_SUA": true,
+    "nonce_must_match_ticket": true,
+    "ticket_must_be_unexpired": true,
+    "target_sha_must_match": true,
+    "governance_digest_must_match": true,
+    "replay_rejected": true
+  },
+  "protected_governance": [
+    "policy",
+    "evidence_criteria",
+    "promotion_criteria",
+    "terminal_conditions",
+    "trust_roots"
+  ]
+}
