@@ -1,4 +1,5 @@
 import hashlib, hmac, json, os, tempfile, time, unittest
+from concurrent.futures import ThreadPoolExecutor
 from gateway import Ledger, verify_github_signature, normalize_workflow_run
 
 class GatewayTests(unittest.TestCase):
@@ -99,6 +100,19 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(PermissionError): self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/try','a'*40,'f'*64,'VERIFYING')
         with self.assertRaises(ValueError): self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64,'ACTING')
         self.assertEqual(self.l.get(t['ticket'])['status'],'ACTING')
+    def test_concurrent_token_consume_is_one_time(self):
+        t=self.authorize(); auth=self.l.repair_token(t['ticket'],'yanhul/AIOS','a'*40,'f'*64)
+        def consume():
+            try:
+                self.l.consume_repair_token(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64)
+                return 'ok'
+            except PermissionError:
+                return 'rejected'
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results=list(pool.map(lambda _: consume(), range(8)))
+        self.assertEqual(results.count('ok'),1)
+        self.assertEqual(results.count('rejected'),7)
+        self.assertTrue(self.l.verify_event_chain())
     def test_protocol_shape(self):
         with open('protocol.json',encoding='utf-8') as f: p=json.load(f)
         self.assertTrue(p['authorization']['replay_rejected']); self.assertEqual(p['commands']['RETRY']['effect'],'retry_verify_only')
