@@ -192,14 +192,15 @@ class Ledger:
 
     def consume_repair_token(self, raw, ticket, repo, sha, gov):
         if not isinstance(raw,str) or not raw: raise PermissionError("missing authorization token")
-        row=self.db.execute("SELECT * FROM repair_authorizations WHERE token_hash=?",(digest(raw),)).fetchone()
+        token_hash=digest(raw)
+        row=self.db.execute("SELECT * FROM repair_authorizations WHERE token_hash=?",(token_hash,)).fetchone()
         if not row or row["consumed"] or row["revoked"]: raise PermissionError("invalid, revoked, or replayed authorization token")
         ticket_row=self.get(ticket)
         if not ticket_row or ticket_row["status"] != "ACTING": raise PermissionError("repair ticket not active")
         if now() > row["expires_at"]: raise PermissionError("authorization token expired")
         if row["ticket"] != ticket or row["repo"] != repo or row["head_sha"] != sha or row["governance_digest"] != gov: raise PermissionError("authorization binding mismatch")
-        self.db.execute("UPDATE repair_authorizations SET consumed=1 WHERE token_hash=? AND consumed=0 AND revoked=0",(digest(raw),))
-        if self.db.total_changes != 1: raise PermissionError("authorization race or replay")
+        cur=self.db.execute("UPDATE repair_authorizations SET consumed=1 WHERE token_hash=? AND consumed=0 AND revoked=0",(token_hash,))
+        if cur.rowcount != 1: raise PermissionError("authorization race or replay")
         self._event(ticket,"REPAIR_AUTH_CONSUMED","repair-worker",{"repo":repo,"head_sha":sha})
         self.db.commit()
         return {"ticket":ticket,"repo":repo,"head_sha":sha,"governance_digest":gov,"effect":"repair"}
