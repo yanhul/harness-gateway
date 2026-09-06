@@ -22,4 +22,4 @@ jobs:
       - name: Security tests
         run: python -m unittest -v
       - name: Cloudflare smoke tests
-        run: node --test cloudflare/test_index.mjs
+        run: node --test cloudflare/test_index.mjs cloudflare/test_parity.mjs
