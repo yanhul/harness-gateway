@@ -14,7 +14,7 @@ test('webhook is authenticated over raw body and rejects spoofing', () => {
 test('human SUA binds governance from stored ticket', () => {
   assert.match(source, /SELECT \* FROM tickets WHERE ticket=\?/);
   assert.match(source, /governance_digest:r\.governance_digest/);
-  assert.match(source, /cmd==='SUA'/);
+  assert.match(source, /!\['SUA','BOQUA','RETRY'\]/);
   assert.match(source, /parts\.length!==3/);
 });
 
