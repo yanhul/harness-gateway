@@ -62,6 +62,9 @@ class GatewayE2ETests(unittest.TestCase):
             "governance_digest": gov,
             "failure": "test_failure",
         }
+        # Capture the nonce only through the internal ticket-creation boundary;
+        # the HTTP webhook response intentionally never exposes it.
+        row, nonce = self.ledger.create(payload)
         raw = json.dumps(payload, separators=(",", ":")).encode()
         sig = "sha256=" + hmac.new(b"webhook-secret", raw, hashlib.sha256).hexdigest()
         status, created = self.post("/github/webhook", payload, {
@@ -70,9 +73,8 @@ class GatewayE2ETests(unittest.TestCase):
         })
         self.assertEqual(status, 200)
         self.assertTrue(created["accepted"])
-        ticket = created["ticket"]
-        row, nonce = self.ledger.create(payload)
-        self.assertEqual(row["ticket"], ticket)
+        self.assertFalse(created["new"])
+        ticket = row["ticket"]
 
         status, authorized = self.post("/sms/command", {"text": f"SUA {ticket} {nonce}", "governance_digest": gov}, {
             "X-Gateway-Token": "android-token",
