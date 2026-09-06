@@ -1,0 +1,8 @@
+{
+  "name": "harness-gateway-cloudflare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test_index.mjs test_parity.mjs"
+  }
+}
