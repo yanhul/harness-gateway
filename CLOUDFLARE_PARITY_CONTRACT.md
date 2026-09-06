@@ -85,7 +85,7 @@ Every state-changing effect appends an event containing at least:
 - previous event hash;
 - current event hash.
 
-The event hash is deterministic SHA-256 over a fixed canonical encoding of the previous hash, ticket, event type, actor, payload, and creation time. Empty/placeholder hashes are forbidden. Verification must detect any mutation or broken predecessor link.
+For exact parity with the Python reference, the deterministic event hash is SHA-256 over `previous_hash + event_type + actor + canonical_payload`, where canonical payload is JSON with sorted keys and compact separators. Creation time is persisted as an audit field but is not part of the Python reference hash preimage. Empty/placeholder hashes are forbidden. Verification must detect any mutation or broken predecessor link.
 
 ## Persistence/concurrency contract
 
