@@ -1,0 +1,16 @@
+name = "harness-gateway"
+main = "src/index.js"
+compatibility_date = "2026-09-06"
+
+[durable_objects]
+bindings = [
+  { name = "GATEWAY", class_name = "GatewayDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GatewayDO"]
+
+[vars]
+# Set secrets with `wrangler secret put`; never commit secret values.
+REPO_ALLOWLIST = "yanhul/AIOS,yanhul/try,yanhul/android-ai-assistant,yanhul/RX50"
