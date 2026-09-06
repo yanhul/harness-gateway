@@ -8,7 +8,7 @@ import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 
-from gateway import Handler, Ledger
+from gateway import Handler, Ledger, normalize_workflow_run
 
 
 class GatewayE2ETests(unittest.TestCase):
@@ -64,7 +64,7 @@ class GatewayE2ETests(unittest.TestCase):
         }
         # Capture the nonce only through the internal ticket-creation boundary;
         # the HTTP webhook response intentionally never exposes it.
-        row, nonce = self.ledger.create(payload)
+        row, nonce = self.ledger.create(normalize_workflow_run(payload))
         raw = json.dumps(payload, separators=(",", ":")).encode()
         sig = "sha256=" + hmac.new(b"webhook-secret", raw, hashlib.sha256).hexdigest()
         status, created = self.post("/github/webhook", payload, {
