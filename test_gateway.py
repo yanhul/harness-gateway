@@ -15,6 +15,10 @@ class GatewayTests(unittest.TestCase):
         t,nonce=self.l.create(self.event())
         self.l.command('+84123456789',f'SUA {t["ticket"]} {nonce}',True,'f'*64)
         return t
+    def active_auth(self):
+        t=self.authorize(); auth=self.l.repair_token(t['ticket'],'yanhul/AIOS','a'*40,'f'*64)
+        self.l.consume_repair_token(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64)
+        return t,auth
     def test_signature(self):
         b=b'{}'; s=hmac.new(b'secret',b,hashlib.sha256).hexdigest()
         self.assertTrue(verify_github_signature(b,'sha256='+s,'secret'))
@@ -78,6 +82,23 @@ class GatewayTests(unittest.TestCase):
         t=self.authorize(); out=self.l.command('+84123456789','STOP',True)
         self.assertEqual(out['revoked'],1)
         with self.assertRaises(PermissionError): self.l.repair_token(t['ticket'],'yanhul/AIOS','a'*40,'f'*64)
+    def test_lifecycle_requires_consumed_worker_authorization(self):
+        t=self.authorize(); auth=self.l.repair_token(t['ticket'],'yanhul/AIOS','a'*40,'f'*64)
+        with self.assertRaises(PermissionError): self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64,'VERIFYING')
+        self.assertEqual(self.l.get(t['ticket'])['status'],'ACTING')
+    def test_lifecycle_enforces_order(self):
+        t,auth=self.active_auth()
+        with self.assertRaises(PermissionError): self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64,'PERSISTED')
+        self.assertEqual(self.l.get(t['ticket'])['status'],'ACTING')
+        self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64,'VERIFYING')
+        self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64,'PERSISTED')
+        self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64,'RESUMED')
+        self.assertEqual(self.l.get(t['ticket'])['status'],'RESUMED')
+    def test_lifecycle_binding_and_illegal_jump_rejected(self):
+        t,auth=self.active_auth()
+        with self.assertRaises(PermissionError): self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/try','a'*40,'f'*64,'VERIFYING')
+        with self.assertRaises(ValueError): self.l.lifecycle(auth['authorization_token'],t['ticket'],'yanhul/AIOS','a'*40,'f'*64,'ACTING')
+        self.assertEqual(self.l.get(t['ticket'])['status'],'ACTING')
     def test_protocol_shape(self):
         with open('protocol.json',encoding='utf-8') as f: p=json.load(f)
         self.assertTrue(p['authorization']['replay_rejected']); self.assertEqual(p['commands']['RETRY']['effect'],'retry_verify_only')
