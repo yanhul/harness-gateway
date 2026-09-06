@@ -205,6 +205,23 @@ class Ledger:
         self.db.commit()
         return {"ticket":ticket,"repo":repo,"head_sha":sha,"governance_digest":gov,"effect":"repair"}
 
+    def lifecycle(self, raw, ticket, repo, sha, gov, status):
+        """Advance only the governed worker lifecycle after token consumption."""
+        if status not in {"VERIFYING", "PERSISTED", "RESUMED"}:
+            raise ValueError("invalid lifecycle status")
+        token_hash=digest(raw) if isinstance(raw,str) and raw else ""
+        auth=self.db.execute("SELECT * FROM repair_authorizations WHERE token_hash=?",(token_hash,)).fetchone()
+        if not auth or not auth["consumed"] or auth["revoked"]:
+            raise PermissionError("worker authorization not consumed or revoked")
+        if auth["ticket"] != ticket or auth["repo"] != repo or auth["head_sha"] != sha or auth["governance_digest"] != gov:
+            raise PermissionError("authorization binding mismatch")
+        row=self.get(ticket)
+        if not row or row["repo"] != repo or row["head_sha"] != sha or row["governance_digest"] != gov:
+            raise PermissionError("ticket binding mismatch")
+        self._transition(ticket,status,"repair-worker")
+        self.db.commit()
+        return {"ticket":ticket,"status":status,"repo":repo,"head_sha":sha,"governance_digest":gov}
+
 
 def verify_github_signature(body: bytes, signature: str, secret: str) -> bool:
     if not signature.startswith("sha256="): return False
@@ -248,6 +265,11 @@ class Handler(BaseHTTPRequestHandler):
                 if raw:
                     return self._json(200,self.ledger.consume_repair_token(raw,p["ticket"],p["repo"],p["head_sha"],p["governance_digest"]))
                 return self._json(200,self.ledger.repair_token(p["ticket"],p["repo"],p["head_sha"],p["governance_digest"]))
+            if self.path == "/repair/lifecycle":
+                token=self.headers.get("X-Repair-Worker-Token",""); expected=os.environ.get("REPAIR_WORKER_TOKEN","")
+                if not expected or not hmac.compare_digest(token,expected): return self._json(401,{"error":"unauthorized"})
+                p=json.loads(body)
+                return self._json(200,self.ledger.lifecycle(p.get("authorization_token"),p["ticket"],p["repo"],p["head_sha"],p["governance_digest"],p["status"]))
             return self._json(404,{"error":"not_found"})
         except (ValueError,PermissionError,KeyError,json.JSONDecodeError) as e: return self._json(400,{"error":str(e)})
 
