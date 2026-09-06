@@ -23,6 +23,7 @@ test('Cloudflare source uses durable SQLite and atomic one-time guards', async (
   const source = await fs.readFile(new URL('./src/index.js', import.meta.url), 'utf8');
   assert.match(source, /state\.storage\.sql/);
   assert.match(source, /blockConcurrencyWhile/);
-  assert.match(source, /nonce_consumed=1/);
+  assert.match(source, /nonce_used=1/);
+  assert.match(source, /nonce_used=0/);
   assert.match(source, /consumed=0/);
 });
