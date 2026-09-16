@@ -1,8 +1,23 @@
 {
-  "protocol_version": 2,
-  "authority": "human_identity",
+  "protocol_version": 3,
+  "authority_owner": "yanhul/AIOS",
+  "gateway_role": "external_effect_boundary",
+  "effect_contract": {
+    "required": [
+      "effect_id",
+      "action",
+      "capability_ref",
+      "authority_ref",
+      "evidence_ref",
+      "lineage_ref",
+      "idempotency_key"
+    ],
+    "owner": "AIOS",
+    "gateway_may_bind": true,
+    "gateway_may_create_authority": false
+  },
   "commands": {
-    "CREATE": {"args": ["ticket", "repository", "target_sha", "nonce", "ttl_seconds"], "effect": "create_ticket"},
+    "CREATE": {"args": ["ticket", "repository", "target_sha", "nonce", "ttl_seconds", "effect_contract"], "effect": "create_ticket"},
     "SUA": {"args": ["ticket", "nonce", "sender", "target_sha"], "effect": "authorize_one_repair"},
     "BOQUA": {"args": ["ticket", "sender"], "effect": "reject_repair"},
     "RETRY": {"args": ["ticket", "sender"], "effect": "retry_verification_only"},
@@ -10,6 +25,16 @@
     "RECEIPT": {"args": ["ticket", "receipt"], "effect": "record_bound_receipt"},
     "STATUS": {"args": [], "effect": "read_status"},
     "STOP": {"args": ["sender"], "effect": "revoke_pending_and_authorized"}
+  },
+  "normalized_identity": {
+    "effect_id": "AIOS effect identity",
+    "attempt_id": "gateway execution attempt identity",
+    "capability_ref": "AIOS capability reference",
+    "authority_ref": "AIOS permit/authority reference",
+    "evidence_ref": "pre-effect evidence reference",
+    "lineage_ref": "AIOS lineage reference",
+    "idempotency_key": "effect deduplication identity",
+    "target_sha": "exact worker target revision"
   },
   "authorization": {
     "sender_identity_required": true,
@@ -20,7 +45,9 @@
     "governance_digest_must_match": true,
     "replay_rejected": true,
     "effect_requires_authorized_ticket": true,
-    "receipt_must_bind_ticket_attempt_target": true,
+    "effect_requires_aios_contract": true,
+    "receipt_must_bind_ticket_attempt_target_effect": true,
+    "receipt_requires_evidence_and_lineage": true,
     "stop_revokes_pending_and_authorized": true
   },
   "protected_governance": [
@@ -31,6 +58,8 @@
     "trust_roots"
   ],
   "security_boundary": {
+    "aios_owns_authority": true,
+    "gateway_does_not_create_permits": true,
     "gateway_does_not_hold_github_credentials": true,
     "gateway_does_not_execute_shell_commands": true,
     "gateway_does_not_modify_repository_code": true,
