@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Mapping
 
 TERMINAL = {"REJECTED", "COMPLETED", "EXPIRED"}
+RETRY_REQUIRES_VERIFY = {"UNKNOWN_REQUIRES_VERIFY", "FAILED_REQUIRES_VERIFY"}
 PROTECTED = ("policy", "evidence_criteria", "promotion_criteria", "terminal_conditions", "trust_roots")
 CONTRACT_FIELDS = ("effect_id", "action", "capability_ref", "authority_ref", "evidence_ref", "lineage_ref", "idempotency_key")
 RECEIPT_FIELDS = ("ticket_id", "attempt_id", "target_sha", "effect_id", "idempotency_key", "status", "evidence_ref", "lineage_ref")
@@ -107,6 +108,34 @@ class Gateway:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
+    def _lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
+    def _acquire_lock(self, timeout: float = 10.0, poll: float = 0.01) -> int:
+        """Acquire a cross-process exclusive lock using atomic directory creation."""
+        lock = self._lock_path()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                lock.mkdir(parents=True)
+                token = lock / "owner"
+                token.write_text(str(os.getpid()), encoding="utf-8")
+                return 1
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise GatewayError("state lock timeout")
+                time.sleep(poll)
+
+    def _release_lock(self) -> None:
+        lock = self._lock_path()
+        try:
+            owner = lock / "owner"
+            if owner.exists():
+                owner.unlink()
+            lock.rmdir()
+        except FileNotFoundError:
+            pass
+
     def create_ticket(self, ticket_id: str, repository: str, target_sha: str, nonce: str,
                       ttl_seconds: int, effect_contract: Mapping[str, object] | None = None) -> Ticket:
         if not all((ticket_id, repository, target_sha, nonce)) or ttl_seconds <= 0:
@@ -177,16 +206,35 @@ class Gateway:
             raise AuthorizationError("sender identity mismatch")
         self._data["revoked"] = True
         for raw in self._data["tickets"].values():
-            if raw["state"] in {"PENDING", "AUTHORIZED"}:
+            if raw["state"] in {"PENDING", "AUTHORIZED", *RETRY_REQUIRES_VERIFY}:
                 raw["state"] = "REJECTED"
         self._save()
 
-    def retry_verify_only(self, ticket_id: str, sender: str) -> Ticket:
+    def authorize_retry(self, ticket_id: str, sender: str) -> Ticket:
+        """Explicit human VERIFY -> RETRY authorization after ambiguity/failure."""
         t = self._ticket(ticket_id)
         if sender != self.human_identity:
             raise AuthorizationError("sender identity mismatch")
-        if t.state not in {"AUTHORIZED", "FAILED"}:
-            raise AuthorizationError("retry requires authorized/failed ticket")
+        if self._data.get("revoked"):
+            raise AuthorizationError("gateway revoked")
+        if t.state not in RETRY_REQUIRES_VERIFY:
+            raise AuthorizationError(f"retry authorization requires verification state: {t.state}")
+        if self._now() >= t.expires_at:
+            self._transition(ticket_id, "EXPIRED")
+            raise AuthorizationError("ticket expired")
+        self._check_governance(t)
+        raw = self._data["tickets"][ticket_id]
+        raw["state"] = "AUTHORIZED"
+        self._save()
+        return self._ticket(ticket_id)
+
+    def retry_verify_only(self, ticket_id: str, sender: str) -> Ticket:
+        """Verification-only check; never grants retry authorization."""
+        t = self._ticket(ticket_id)
+        if sender != self.human_identity:
+            raise AuthorizationError("sender identity mismatch")
+        if t.state not in {"AUTHORIZED", *RETRY_REQUIRES_VERIFY}:
+            raise AuthorizationError("verification requires authorized/retry-pending ticket")
         self._check_governance(t)
         if self._now() >= t.expires_at:
             self._transition(ticket_id, "EXPIRED")
@@ -194,21 +242,28 @@ class Gateway:
         return t
 
     def begin_effect(self, ticket_id: str, target_sha: str) -> dict[str, object]:
-        t = self._ticket(ticket_id)
-        if t.state != "AUTHORIZED":
-            raise AuthorizationError("effect requires authorized ticket")
-        self._check_governance(t)
-        if target_sha != t.target_sha:
-            raise AuthorizationError("target sha mismatch")
-        if t.effect_contract is None:
-            raise AuthorizationError("effect requires AIOS contract binding")
-        contract = _require_contract(t.effect_contract)
-        attempt_id = f"{ticket_id}:{t.attempts + 1}"
-        self._data["tickets"][ticket_id]["attempts"] = t.attempts + 1
-        self._save()
-        return {**contract, "ticket_id": ticket_id, "attempt_id": attempt_id,
-                "repository": t.repository, "target_sha": t.target_sha,
-                "governance_digest": t.governance_digest}
+        """Atomically reload and allocate the next attempt under the state lock."""
+        lock_acquired = self._acquire_lock()
+        try:
+            self._data = self._load()
+            t = self._ticket(ticket_id)
+            if t.state != "AUTHORIZED":
+                raise AuthorizationError("effect requires authorized ticket")
+            self._check_governance(t)
+            if target_sha != t.target_sha:
+                raise AuthorizationError("target sha mismatch")
+            if t.effect_contract is None:
+                raise AuthorizationError("effect requires AIOS contract binding")
+            contract = _require_contract(t.effect_contract)
+            attempt_id = f"{ticket_id}:{t.attempts + 1}"
+            self._data["tickets"][ticket_id]["attempts"] = t.attempts + 1
+            self._save()
+            return {**contract, "ticket_id": ticket_id, "attempt_id": attempt_id,
+                    "repository": t.repository, "target_sha": t.target_sha,
+                    "governance_digest": t.governance_digest}
+        finally:
+            if lock_acquired:
+                self._release_lock()
 
     def record_receipt(self, ticket_id: str, receipt: Mapping[str, object]) -> Ticket:
         t = self._ticket(ticket_id)
@@ -236,7 +291,14 @@ class Gateway:
                 raise GatewayError("duplicate receipt for attempt")
         raw = self._data["tickets"][ticket_id]
         raw["last_receipt"] = dict(receipt)
-        raw["state"] = "COMPLETED" if status == "COMPLETED" else ("FAILED" if status == "FAILED" else "AUTHORIZED")
+        if status == "COMPLETED":
+            raw["state"] = "COMPLETED"
+        elif status == "FAILED":
+            raw["state"] = "FAILED_REQUIRES_VERIFY"
+        elif status == "UNKNOWN":
+            raw["state"] = "UNKNOWN_REQUIRES_VERIFY"
+        else:
+            raw["state"] = "AUTHORIZED"
         self._save()
         return self._ticket(ticket_id)
 
