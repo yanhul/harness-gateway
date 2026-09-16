@@ -6,6 +6,15 @@ from gateway import AuthorizationError, Gateway, GatewayError
 
 
 GOV = {k: f"digest-{k}" for k in ("policy", "evidence_criteria", "promotion_criteria", "terminal_conditions", "trust_roots")}
+EFFECT_CONTRACT = {
+    "effect_id": "E1",
+    "action": "research.execute",
+    "capability_ref": "try.research@1",
+    "authority_ref": "permit:E1",
+    "evidence_ref": "evidence:E1",
+    "lineage_ref": "lineage:E1",
+    "idempotency_key": "idem:E1",
+}
 
 
 class Clock:
@@ -19,7 +28,7 @@ class GatewayTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.clock = Clock()
         self.g = Gateway(Path(self.tmp.name) / "state.json", "+84999", GOV, self.clock)
-        self.g.create_ticket("T1", "yanhul/try", "abc123", "N1", 60)
+        self.g.create_ticket("T1", "yanhul/try", "abc123", "N1", 60, EFFECT_CONTRACT)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -54,9 +63,18 @@ class GatewayTests(unittest.TestCase):
         self.g.authorize("T1", "N1", "+84999", "abc123")
         effect = self.g.begin_effect("T1", "abc123")
         self.assertEqual(effect["attempt_id"], "T1:1")
+        self.assertEqual(effect["effect_id"], "E1")
         with self.assertRaises(GatewayError):
-            self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:9", "target_sha": "abc123", "status": "COMPLETED"})
-        t = self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:1", "target_sha": "abc123", "status": "COMPLETED"})
+            self.g.record_receipt("T1", {
+                "ticket_id": "T1", "attempt_id": "T1:9", "target_sha": "abc123",
+                "effect_id": "E1", "status": "COMPLETED", "evidence_ref": "evidence:E1",
+                "lineage_ref": "lineage:E1",
+            })
+        t = self.g.record_receipt("T1", {
+            "ticket_id": "T1", "attempt_id": "T1:1", "target_sha": "abc123",
+            "effect_id": "E1", "status": "COMPLETED", "evidence_ref": "evidence:E1",
+            "lineage_ref": "lineage:E1",
+        })
         self.assertEqual(t.state, "COMPLETED")
 
     def test_stop_revokes_pending_and_authorized(self):
