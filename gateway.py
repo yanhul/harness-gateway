@@ -114,6 +114,11 @@ class Gateway:
         if ticket_id in self._data["tickets"]:
             raise GatewayError("ticket already exists")
         contract = _require_contract(effect_contract) if effect_contract is not None else None
+        if contract is not None:
+            for raw in self._data["tickets"].values():
+                existing = raw.get("effect_contract") or {}
+                if existing.get("idempotency_key") == contract["idempotency_key"]:
+                    raise GatewayError("idempotency key already bound to another ticket")
         t = Ticket(ticket_id, repository, target_sha, nonce, self._now() + ttl_seconds,
                    dict(self.governance), effect_contract=contract)
         self._data["tickets"][ticket_id] = asdict(t)
