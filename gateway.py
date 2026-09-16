@@ -6,6 +6,7 @@ receipts, fencing, and explicit reconciliation/retry coordination.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -108,7 +109,6 @@ class Gateway:
 
     @staticmethod
     def _normalize_ticket(raw: dict) -> None:
-        """Normalize legacy v2 snapshots without inventing execution history."""
         raw.setdefault("version", 0)
         raw.setdefault("fence_counter", int(raw.get("attempts", 0)))
         raw.setdefault("retry_authorized", raw.get("state") == "AUTHORIZED")
@@ -118,8 +118,6 @@ class Gateway:
         raw.setdefault("effect_contract", None)
         for attempt in raw["attempt_records"]:
             attempt.setdefault("state", "OPEN")
-        # v2 had only a count and last_receipt. Do not fabricate old receipt
-        # history; future writes are fully append-only.
         if raw.get("attempts", 0) != len(raw["attempt_records"]):
             raw["attempts"] = max(int(raw.get("attempts", 0)), len(raw["attempt_records"]))
 
@@ -179,7 +177,14 @@ class Gateway:
         handle = self._acquire_lock()
         try:
             self._data = self._load()
-            result = fn()
+            before = copy.deepcopy(self._data)
+            try:
+                result = fn()
+            except Exception:
+                if self._data != before:
+                    self._data["version"] = int(self._data.get("version", 0)) + 1
+                    self._save()
+                raise
             self._data["version"] = int(self._data.get("version", 0)) + 1
             self._save()
             return result
@@ -293,15 +298,14 @@ class Gateway:
             contract = _require_contract(t.effect_contract)
             fence = int(raw.get("fence_counter", 0)) + 1
             attempt_id = f"{ticket_id}:{fence}"
-            attempt = {
+            raw["fence_counter"] = fence
+            raw["attempts"] = int(raw.get("attempts", 0)) + 1
+            raw["attempt_records"].append({
                 "attempt_id": attempt_id,
                 "fence": fence,
                 "state": "OPEN",
                 "created_at": self._now(),
-            }
-            raw["fence_counter"] = fence
-            raw["attempts"] = int(raw.get("attempts", 0)) + 1
-            raw["attempt_records"].append(attempt)
+            })
             raw["retry_authorized"] = False
             raw["state"] = "ATTEMPT_OPEN"
             raw["version"] += 1
@@ -319,7 +323,7 @@ class Gateway:
                 raise AuthorizationError("sender identity mismatch")
             if self._data.get("revoked"):
                 raise AuthorizationError("gateway revoked")
-            if t.state != "AUTHORIZED" or raw.get("attempts", 0) == 0:
+            if t.state != "AUTHORIZED" or raw.get("attempts", 0) == 0 or raw.get("retry_authorized"):
                 raise AuthorizationError("retry authorization requires reconciled authorized effect")
             self._expire_if_needed(raw)
             self._check_governance(t)
@@ -332,22 +336,19 @@ class Gateway:
         """Verification-only check; never grants retry authority."""
         def op():
             t = self._ticket(ticket_id)
+            raw = self._raw_ticket(ticket_id)
             if sender != self.human_identity:
                 raise AuthorizationError("sender identity mismatch")
             if t.state != "RECONCILING":
                 raise AuthorizationError("verification requires reconciling ticket")
             self._check_governance(t)
-            self._expire_if_needed(self._raw_ticket(ticket_id))
-            return t
-        return self._read_locked(op)
+            self._expire_if_needed(raw)
+            return self._ticket(ticket_id)
+        return self._mutate(op)
 
     def reconcile(self, ticket_id: str, attempt_id: str, sender: str,
                   outcome: str, verification_ref: str) -> Ticket:
-        """Record authoritative outcome after an ambiguous attempt.
-
-        NO_EFFECT returns the effect to AUTHORIZED but never sets retry authority.
-        EFFECTED closes the effect as COMPLETED. UNRESOLVED remains RECONCILING.
-        """
+        """Record authoritative outcome after an ambiguous attempt."""
         def op():
             raw = self._raw_ticket(ticket_id)
             t = self._ticket(ticket_id)
@@ -399,13 +400,11 @@ class Gateway:
                 raise GatewayError("receipt fence mismatch")
             if any(r.get("attempt_id") == receipt["attempt_id"] for r in raw["receipts"]):
                 raise GatewayError("duplicate receipt for attempt")
-
             bound = dict(receipt)
             bound["recorded_at"] = self._now()
             bound["stale"] = raw["state"] != "ATTEMPT_OPEN" or int(attempt["fence"]) != int(raw["fence_counter"])
             raw["receipts"].append(bound)
             raw["last_receipt"] = bound
-
             if bound["stale"]:
                 attempt["state"] = "STALE_RECEIPT_RECORDED"
             elif status == "COMPLETED":
