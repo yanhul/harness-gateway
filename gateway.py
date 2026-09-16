@@ -14,9 +14,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-TERMINAL = {"REJECTED", "COMPLETED", "FAILED", "EXPIRED"}
+TERMINAL = {"REJECTED", "COMPLETED", "EXPIRED"}
 PROTECTED = ("policy", "evidence_criteria", "promotion_criteria", "terminal_conditions", "trust_roots")
 CONTRACT_FIELDS = ("effect_id", "action", "capability_ref", "authority_ref", "evidence_ref", "lineage_ref", "idempotency_key")
+RECEIPT_FIELDS = ("ticket_id", "attempt_id", "target_sha", "effect_id", "idempotency_key", "status", "evidence_ref", "lineage_ref")
+RECEIPT_STATUSES = {"OBSERVED", "UNKNOWN", "FAILED", "COMPLETED"}
 
 
 def sha256_text(value: str) -> str:
@@ -205,19 +207,28 @@ class Gateway:
 
     def record_receipt(self, ticket_id: str, receipt: Mapping[str, object]) -> Ticket:
         t = self._ticket(ticket_id)
-        required = ("ticket_id", "attempt_id", "target_sha", "effect_id", "status", "evidence_ref", "lineage_ref")
-        if any(not receipt.get(k) for k in required):
+        if t.state in TERMINAL:
+            raise GatewayError("ticket is terminal")
+        if any(not receipt.get(k) for k in RECEIPT_FIELDS):
             raise GatewayError("receipt missing required fields")
         if receipt["ticket_id"] != ticket_id or receipt["target_sha"] != t.target_sha:
             raise GatewayError("receipt binding mismatch")
-        if not t.effect_contract or receipt["effect_id"] != t.effect_contract["effect_id"]:
-            raise GatewayError("receipt effect binding mismatch")
+        if not t.effect_contract:
+            raise GatewayError("receipt requires AIOS contract binding")
+        contract = _require_contract(t.effect_contract)
         expected_attempt = f"{ticket_id}:{t.attempts}"
         if receipt["attempt_id"] != expected_attempt:
             raise GatewayError("receipt attempt mismatch")
+        for field in ("effect_id", "idempotency_key", "evidence_ref", "lineage_ref"):
+            if receipt[field] != contract[field]:
+                raise GatewayError(f"receipt {field} mismatch")
         status = str(receipt["status"])
-        if status not in {"OBSERVED", "UNKNOWN", "FAILED", "COMPLETED"}:
+        if status not in RECEIPT_STATUSES:
             raise GatewayError("invalid receipt status")
+        if t.last_receipt is not None:
+            previous = t.last_receipt
+            if previous.get("attempt_id") == receipt["attempt_id"]:
+                raise GatewayError("duplicate receipt for attempt")
         raw = self._data["tickets"][ticket_id]
         raw["last_receipt"] = dict(receipt)
         raw["state"] = "COMPLETED" if status == "COMPLETED" else ("FAILED" if status == "FAILED" else "AUTHORIZED")
