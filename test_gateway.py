@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -26,7 +27,8 @@ class GatewayTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.clock = Clock()
-        self.g = Gateway(Path(self.tmp.name) / "state.json", "+84999", GOV, self.clock)
+        self.path = Path(self.tmp.name) / "state.json"
+        self.g = Gateway(self.path, "+84999", GOV, self.clock)
         self.g.create_ticket("T1", "yanhul/try", "abc123", "N1", 60, CONTRACT)
 
     def tearDown(self):
@@ -101,34 +103,78 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(GatewayError):
             self.g.record_receipt("T1", self._receipt(effect, target_sha="wrong"))
 
-    def test_unknown_is_not_success_and_can_be_retried(self):
+    def test_unknown_requires_explicit_verify_then_retry_authorization(self):
         effect = self._authorize_and_begin()
         t = self.g.record_receipt("T1", self._receipt(effect, status="UNKNOWN"))
-        self.assertEqual(t.state, "AUTHORIZED")
-        self.assertEqual(t.last_receipt["status"], "UNKNOWN")
-        retry = self.g.retry_verify_only("T1", "+84999")
+        self.assertEqual(t.state, "UNKNOWN_REQUIRES_VERIFY")
+        with self.assertRaises(AuthorizationError):
+            self.g.begin_effect("T1", "abc123")
+        verified = self.g.retry_verify_only("T1", "+84999")
+        self.assertEqual(verified.state, "UNKNOWN_REQUIRES_VERIFY")
+        retry = self.g.authorize_retry("T1", "+84999")
         self.assertEqual(retry.state, "AUTHORIZED")
+        second = self.g.begin_effect("T1", "abc123")
+        self.assertEqual(second["attempt_id"], "T1:2")
 
-    def test_failed_is_retryable_but_completed_is_terminal(self):
+    def test_failed_requires_explicit_verify_then_retry_authorization(self):
         effect = self._authorize_and_begin()
         t = self.g.record_receipt("T1", self._receipt(effect, status="FAILED"))
-        self.assertEqual(t.state, "FAILED")
-        retry = self.g.retry_verify_only("T1", "+84999")
-        self.assertEqual(retry.state, "FAILED")
+        self.assertEqual(t.state, "FAILED_REQUIRES_VERIFY")
         with self.assertRaises(AuthorizationError):
             self.g.begin_effect("T1", "abc123")
+        self.g.retry_verify_only("T1", "+84999")
+        self.assertEqual(self.g.status()["tickets"]["T1"]["state"], "FAILED_REQUIRES_VERIFY")
+        self.g.authorize_retry("T1", "+84999")
+        second = self.g.begin_effect("T1", "abc123")
+        self.assertEqual(second["attempt_id"], "T1:2")
 
-    def test_completed_receipt_is_terminal_and_replay_is_rejected(self):
+    def test_retry_authorization_checks_identity_governance_and_expiry(self):
         effect = self._authorize_and_begin()
-        receipt = self._receipt(effect)
-        t = self.g.record_receipt("T1", receipt)
-        self.assertEqual(t.state, "COMPLETED")
-        with self.assertRaises(GatewayError):
-            self.g.record_receipt("T1", receipt)
+        self.g.record_receipt("T1", self._receipt(effect, status="UNKNOWN"))
+        with self.assertRaises(AuthorizationError):
+            self.g.authorize_retry("T1", "+84000")
+        self.g.governance["policy"] = "changed"
+        with self.assertRaises(AuthorizationError):
+            self.g.authorize_retry("T1", "+84999")
+        self.g.governance["policy"] = GOV["policy"]
+        self.clock.value = 1060.0
+        with self.assertRaises(AuthorizationError):
+            self.g.authorize_retry("T1", "+84999")
+        self.assertEqual(self.g.status()["tickets"]["T1"]["state"], "EXPIRED")
+
+    def test_completed_is_never_retryable(self):
+        effect = self._authorize_and_begin()
+        self.g.record_receipt("T1", self._receipt(effect))
+        with self.assertRaises(AuthorizationError):
+            self.g.authorize_retry("T1", "+84999")
         with self.assertRaises(AuthorizationError):
             self.g.begin_effect("T1", "abc123")
 
-    def test_stop_revokes_pending_and_authorized(self):
+    def test_concurrent_gateways_allocate_unique_attempts(self):
+        self.g.authorize("T1", "N1", "+84999", "abc123")
+        results = []
+        errors = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            gateway = Gateway(self.path, "+84999", GOV, self.clock)
+            barrier.wait()
+            try:
+                results.append(gateway.begin_effect("T1", "abc123")["attempt_id"])
+            except Exception as exc:  # noqa: BLE001 - adversarial concurrency test
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors, errors)
+        self.assertEqual(sorted(results), ["T1:1", "T1:2"])
+        self.assertEqual(self.g.status()["tickets"]["T1"]["attempts"], 2)
+
+    def test_stop_revokes_pending_and_retry_pending(self):
         self.g.authorize("T1", "N1", "+84999", "abc123")
         self.g.stop("+84999")
         self.assertEqual(self.g.status()["revoked"], True)
