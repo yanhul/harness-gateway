@@ -32,6 +32,24 @@ class GatewayTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _authorize_and_begin(self):
+        self.g.authorize("T1", "N1", "+84999", "abc123")
+        return self.g.begin_effect("T1", "abc123")
+
+    def _receipt(self, effect, **overrides):
+        receipt = {
+            "ticket_id": "T1",
+            "attempt_id": effect["attempt_id"],
+            "target_sha": "abc123",
+            "effect_id": effect["effect_id"],
+            "idempotency_key": effect["idempotency_key"],
+            "status": "COMPLETED",
+            "evidence_ref": effect["evidence_ref"],
+            "lineage_ref": effect["lineage_ref"],
+        }
+        receipt.update(overrides)
+        return receipt
+
     def test_authorize_requires_exact_human_and_target(self):
         with self.assertRaises(AuthorizationError):
             self.g.authorize("T1", "N1", "+84000", "abc123")
@@ -56,28 +74,56 @@ class GatewayTests(unittest.TestCase):
             self.g.authorize("T1", "N1", "+84999", "abc123")
         self.assertEqual(self.g.status()["tickets"]["T1"]["state"], "EXPIRED")
 
-    def test_effect_requires_aios_contract_and_receipt_is_bound(self):
+    def test_effect_requires_aios_contract(self):
         g2 = Gateway(Path(self.tmp.name) / "no-contract.json", "+84999", GOV, self.clock)
         g2.create_ticket("T2", "yanhul/try", "abc123", "N2", 60)
         g2.authorize("T2", "N2", "+84999", "abc123")
         with self.assertRaises(AuthorizationError):
             g2.begin_effect("T2", "abc123")
 
-        self.g.authorize("T1", "N1", "+84999", "abc123")
-        effect = self.g.begin_effect("T1", "abc123")
-        self.assertEqual(effect["attempt_id"], "T1:1")
-        self.assertEqual(effect["authority_ref"], CONTRACT["authority_ref"])
-        with self.assertRaises(GatewayError):
-            self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:9", "target_sha": "abc123", "effect_id": "E1", "status": "COMPLETED", "evidence_ref": "evidence:x", "lineage_ref": "lineage:x"})
-        t = self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:1", "target_sha": "abc123", "effect_id": "E1", "status": "COMPLETED", "evidence_ref": "evidence:x", "lineage_ref": "lineage:x"})
-        self.assertEqual(t.state, "COMPLETED")
+    def test_receipt_requires_exact_contract_binding(self):
+        effect = self._authorize_and_begin()
+        for field in ("effect_id", "idempotency_key", "evidence_ref", "lineage_ref"):
+            bad = self._receipt(effect, **{field: "forged"})
+            with self.subTest(field=field):
+                with self.assertRaises(GatewayError):
+                    self.g.record_receipt("T1", bad)
 
-    def test_receipt_cannot_cross_effect(self):
-        self.g.authorize("T1", "N1", "+84999", "abc123")
-        self.g.begin_effect("T1", "abc123")
-        bad = {"ticket_id": "T1", "attempt_id": "T1:1", "target_sha": "abc123", "effect_id": "OTHER", "status": "COMPLETED", "evidence_ref": "evidence:x", "lineage_ref": "lineage:x"}
+    def test_receipt_cannot_cross_attempt_or_target(self):
+        effect = self._authorize_and_begin()
         with self.assertRaises(GatewayError):
-            self.g.record_receipt("T1", bad)
+            self.g.record_receipt("T1", self._receipt(effect, attempt_id="T1:9"))
+        with self.assertRaises(GatewayError):
+            self.g.record_receipt("T1", self._receipt(effect, target_sha="wrong"))
+
+    def test_unknown_is_not_success_and_can_be_retried(self):
+        effect = self._authorize_and_begin()
+        t = self.g.record_receipt("T1", self._receipt(effect, status="UNKNOWN"))
+        self.assertEqual(t.state, "AUTHORIZED")
+        self.assertEqual(t.last_receipt["status"], "UNKNOWN")
+        retry = self.g.retry_verify_only("T1", "+84999")
+        self.assertEqual(retry.state, "AUTHORIZED")
+
+    def test_failed_is_retryable_but_completed_is_terminal(self):
+        effect = self._authorize_and_begin()
+        t = self.g.record_receipt("T1", self._receipt(effect, status="FAILED"))
+        self.assertEqual(t.state, "FAILED")
+        retry = self.g.retry_verify_only("T1", "+84999")
+        self.assertEqual(retry.state, "FAILED")
+        # A retry requires explicit authorization to begin a new effect; the
+        # gateway never silently turns FAILED into a new dispatch.
+        with self.assertRaises(AuthorizationError):
+            self.g.begin_effect("T1", "abc123")
+
+    def test_completed_receipt_is_terminal_and_replay_is_rejected(self):
+        effect = self._authorize_and_begin()
+        receipt = self._receipt(effect)
+        t = self.g.record_receipt("T1", receipt)
+        self.assertEqual(t.state, "COMPLETED")
+        with self.assertRaises(GatewayError):
+            self.g.record_receipt("T1", receipt)
+        with self.assertRaises(AuthorizationError):
+            self.g.begin_effect("T1", "abc123")
 
     def test_stop_revokes_pending_and_authorized(self):
         self.g.authorize("T1", "N1", "+84999", "abc123")
