@@ -21,6 +21,20 @@ AIOS CONTROL PLANE
 
 AIOS remains the authority owner. Repository adapters remain responsible for their domain evidence/workload semantics. The gateway prevents a repair effect from crossing the boundary without an explicit, bound authorization.
 
+## Effect contract v3
+
+`CREATE` persists the AIOS-supplied effect contract. The gateway requires these fields before `BEGIN_EFFECT` can cross the external boundary:
+
+- `effect_id`
+- `action`
+- `capability_ref`
+- `authority_ref`
+- `evidence_ref`
+- `lineage_ref`
+- `idempotency_key`
+
+The gateway never creates authority or capability records. It only binds them to the human-approved ticket, exact `target_sha`, generated `attempt_id`, and returned receipt. See `EFFECT_CONTRACT.md`.
+
 ## Fail-closed invariants
 
 1. Exact human sender identity is required for authorization/rejection/stop/retry.
@@ -30,11 +44,11 @@ AIOS remains the authority owner. Repository adapters remain responsible for the
 5. Protected governance digests are snapshotted at ticket creation and rechecked before authorization/effect.
 6. Effects require an `AUTHORIZED` ticket and the exact target SHA.
 7. Each effect gets a monotonic `attempt_id` bound to the ticket.
-8. Receipts must bind `ticket_id`, `attempt_id`, and `target_sha`; mismatches fail closed.
+8. Receipts bind `ticket_id`, `attempt_id`, `target_sha`, `effect_id`, `evidence_ref`, and `lineage_ref`.
 9. `STOP` revokes all pending/authorized tickets.
 10. State persistence is atomic (`fsync` + `os.replace`).
 11. The gateway has no GitHub credentials and executes no shell/repository mutation.
-12. A worker must independently enforce the ticket's target SHA and return a bound receipt.
+12. A worker must independently enforce the target SHA and return a bound receipt.
 
 ## Commands
 
@@ -47,7 +61,7 @@ AIOS remains the authority owner. Repository adapters remain responsible for the
 - `STATUS` — inspect persisted state.
 - `STOP` — revoke pending and authorized work.
 
-The canonical machine-readable contract is `protocol.json` (v2).
+The canonical machine-readable contract is `protocol.json` (v3).
 
 ## Transport
 
@@ -61,4 +75,4 @@ Run:
 python -m unittest -v test_gateway.py
 ```
 
-The tests cover sender/target mismatch, nonce replay, governance mutation, expiry, unauthorized effects, receipt binding, and emergency stop.
+The tests cover sender/target mismatch, nonce replay, governance mutation, expiry, missing AIOS contract, cross-effect receipt replay, unauthorized effects, receipt binding, and emergency stop.
