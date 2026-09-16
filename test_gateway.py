@@ -81,6 +81,11 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(AuthorizationError):
             g2.begin_effect("T2", "abc123")
 
+    def test_cross_ticket_idempotency_key_is_rejected(self):
+        other = dict(CONTRACT, effect_id="E2")
+        with self.assertRaises(GatewayError):
+            self.g.create_ticket("T2", "yanhul/try", "def456", "N2", 60, other)
+
     def test_receipt_requires_exact_contract_binding(self):
         effect = self._authorize_and_begin()
         for field in ("effect_id", "idempotency_key", "evidence_ref", "lineage_ref"):
@@ -110,8 +115,6 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(t.state, "FAILED")
         retry = self.g.retry_verify_only("T1", "+84999")
         self.assertEqual(retry.state, "FAILED")
-        # A retry requires explicit authorization to begin a new effect; the
-        # gateway never silently turns FAILED into a new dispatch.
         with self.assertRaises(AuthorizationError):
             self.g.begin_effect("T1", "abc123")
 
