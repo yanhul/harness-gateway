@@ -111,30 +111,43 @@ class Gateway:
     def _lock_path(self) -> Path:
         return self.path.with_name(self.path.name + ".lock")
 
-    def _acquire_lock(self, timeout: float = 10.0, poll: float = 0.01) -> int:
-        """Acquire a cross-process exclusive lock using atomic directory creation."""
+    def _acquire_lock(self, timeout: float = 10.0, poll: float = 0.01):
+        """Acquire a cross-process advisory lock; lock survives process crashes safely."""
         lock = self._lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock, "a+b")
         deadline = time.monotonic() + timeout
         while True:
             try:
-                lock.mkdir(parents=True)
-                token = lock / "owner"
-                token.write_text(str(os.getpid()), encoding="utf-8")
-                return 1
-            except FileExistsError:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    if handle.tell() == 0:
+                        handle.write(b"0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except (BlockingIOError, OSError):
                 if time.monotonic() >= deadline:
+                    handle.close()
                     raise GatewayError("state lock timeout")
                 time.sleep(poll)
 
-    def _release_lock(self) -> None:
-        lock = self._lock_path()
+    def _release_lock(self, handle) -> None:
         try:
-            owner = lock / "owner"
-            if owner.exists():
-                owner.unlink()
-            lock.rmdir()
-        except FileNotFoundError:
-            pass
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     def create_ticket(self, ticket_id: str, repository: str, target_sha: str, nonce: str,
                       ttl_seconds: int, effect_contract: Mapping[str, object] | None = None) -> Ticket:
@@ -243,7 +256,7 @@ class Gateway:
 
     def begin_effect(self, ticket_id: str, target_sha: str) -> dict[str, object]:
         """Atomically reload and allocate the next attempt under the state lock."""
-        lock_acquired = self._acquire_lock()
+        handle = self._acquire_lock()
         try:
             self._data = self._load()
             t = self._ticket(ticket_id)
@@ -262,8 +275,7 @@ class Gateway:
                     "repository": t.repository, "target_sha": t.target_sha,
                     "governance_digest": t.governance_digest}
         finally:
-            if lock_acquired:
-                self._release_lock()
+            self._release_lock(handle)
 
     def record_receipt(self, ticket_id: str, receipt: Mapping[str, object]) -> Ticket:
         t = self._ticket(ticket_id)
