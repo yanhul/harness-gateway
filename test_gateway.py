@@ -68,16 +68,33 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(effect["attempt_id"], "T1:1")
         self.assertEqual(effect["authority_ref"], CONTRACT["authority_ref"])
         with self.assertRaises(GatewayError):
-            self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:9", "target_sha": "abc123", "effect_id": "E1", "status": "COMPLETED", "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"]})
-        t = self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:1", "target_sha": "abc123", "effect_id": "E1", "status": "COMPLETED", "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"]})
+            self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:9", "attempt_fence": 1, "target_sha": "abc123", "effect_id": "E1", "status": "COMPLETED", "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"]})
+        t = self.g.record_receipt("T1", {"ticket_id": "T1", "attempt_id": "T1:1", "attempt_fence": 1, "target_sha": "abc123", "effect_id": "E1", "status": "COMPLETED", "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"]})
         self.assertEqual(t.state, "COMPLETED")
 
     def test_receipt_cannot_cross_effect(self):
         self.g.authorize("T1", "N1", "+84999", "abc123")
         self.g.begin_effect("T1", "abc123")
-        bad = {"ticket_id": "T1", "attempt_id": "T1:1", "target_sha": "abc123", "effect_id": "OTHER", "status": "COMPLETED", "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"]}
+        bad = {"ticket_id": "T1", "attempt_id": "T1:1", "attempt_fence": 1, "target_sha": "abc123", "effect_id": "OTHER", "status": "COMPLETED", "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"]}
         with self.assertRaises(GatewayError):
             self.g.record_receipt("T1", bad)
+
+
+    def test_receipt_must_match_exact_attempt_fence(self):
+        self.g.authorize("T1", "N1", "+84999", "abc123")
+        effect = self.g.begin_effect("T1", "abc123")
+        receipt = {
+            "ticket_id": "T1", "attempt_id": effect["attempt_id"],
+            "attempt_fence": effect["fence"] + 1, "target_sha": "abc123",
+            "effect_id": CONTRACT["effect_id"], "status": "COMPLETED",
+            "evidence_ref": CONTRACT["evidence_ref"],
+            "lineage_ref": CONTRACT["lineage_ref"],
+        }
+        with self.assertRaisesRegex(GatewayError, "attempt fence"):
+            self.g.record_receipt("T1", receipt)
+        receipt["attempt_fence"] = True
+        with self.assertRaisesRegex(GatewayError, "fence is invalid"):
+            self.g.record_receipt("T1", receipt)
 
     def test_stop_revokes_pending_and_authorized(self):
         self.g.authorize("T1", "N1", "+84999", "abc123")
@@ -90,7 +107,7 @@ class GatewayTests(unittest.TestCase):
         self.g.authorize("T1", "N1", "+84999", "abc123")
         effect = self.g.begin_effect("T1", "abc123")
         receipt = {
-            "ticket_id": "T1", "attempt_id": effect["attempt_id"],
+            "ticket_id": "T1", "attempt_id": effect["attempt_id"], "attempt_fence": effect["fence"],
             "target_sha": "abc123", "effect_id": CONTRACT["effect_id"],
             "status": "UNKNOWN", "evidence_ref": CONTRACT["evidence_ref"],
             "lineage_ref": CONTRACT["lineage_ref"],
@@ -120,7 +137,7 @@ class GatewayTests(unittest.TestCase):
         self.g.authorize("T1", "N1", "+84999", "abc123")
         effect = self.g.begin_effect("T1", "abc123")
         receipt = {
-            "ticket_id": "T1", "attempt_id": effect["attempt_id"],
+            "ticket_id": "T1", "attempt_id": effect["attempt_id"], "attempt_fence": effect["fence"],
             "target_sha": "abc123", "effect_id": CONTRACT["effect_id"],
             "status": "COMPLETED", "evidence_ref": "evidence:forged",
             "lineage_ref": CONTRACT["lineage_ref"],
@@ -132,7 +149,7 @@ class GatewayTests(unittest.TestCase):
         self.g.authorize("T1", "N1", "+84999", "abc123")
         first = self.g.begin_effect("T1", "abc123")
         unknown = {
-            "ticket_id": "T1", "attempt_id": first["attempt_id"],
+            "ticket_id": "T1", "attempt_id": first["attempt_id"], "attempt_fence": first["fence"],
             "target_sha": "abc123", "effect_id": CONTRACT["effect_id"],
             "status": "UNKNOWN", "evidence_ref": CONTRACT["evidence_ref"],
             "lineage_ref": CONTRACT["lineage_ref"],
@@ -213,3 +230,4 @@ class GatewayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+[exit status 0]
