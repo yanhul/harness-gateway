@@ -357,11 +357,14 @@ class Gateway:
     @_serialized
     def record_receipt(self, ticket_id: str, receipt: Mapping[str, object]) -> Ticket:
         t = self._ticket(ticket_id)
-        required = ("ticket_id", "attempt_id", "target_sha", "effect_id", "status", "evidence_ref", "lineage_ref")
+        required = ("ticket_id", "attempt_id", "attempt_fence", "target_sha", "effect_id", "status", "evidence_ref", "lineage_ref")
         if not isinstance(receipt, Mapping) or any(not receipt.get(k) for k in required):
             raise GatewayError("receipt missing required fields")
         if receipt["ticket_id"] != ticket_id or receipt["target_sha"] != t.target_sha:
             raise GatewayError("receipt binding mismatch")
+        fence = receipt["attempt_fence"]
+        if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+            raise GatewayError("receipt attempt fence is invalid")
         if not t.effect_contract or receipt["effect_id"] != t.effect_contract["effect_id"]:
             raise GatewayError("receipt effect binding mismatch")
         if receipt["evidence_ref"] != t.effect_contract["evidence_ref"]:
@@ -374,7 +377,8 @@ class Gateway:
         if attempt is None:
             raise GatewayError("receipt attempt is not present in durable attempt history")
         if (attempt.get("effect_id") != receipt["effect_id"]
-                or attempt.get("target_sha") != receipt["target_sha"]):
+                or attempt.get("target_sha") != receipt["target_sha"]
+                or attempt.get("fence") != fence):
             raise GatewayError("receipt does not match durable attempt fence")
         status = str(receipt["status"])
         if status not in RECEIPT_STATUSES:
@@ -407,3 +411,4 @@ class Gateway:
     @_serialized
     def status(self) -> dict:
         return json.loads(json.dumps(self._data, sort_keys=True))
+[exit status 0]
