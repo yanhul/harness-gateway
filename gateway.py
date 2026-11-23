@@ -411,4 +411,3 @@ class Gateway:
     @_serialized
     def status(self) -> dict:
         return json.loads(json.dumps(self._data, sort_keys=True))
-[exit status 0]
