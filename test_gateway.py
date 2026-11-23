@@ -230,4 +230,3 @@ class GatewayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-[exit status 0]
