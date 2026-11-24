@@ -1,10 +1,12 @@
 {
-  "protocol_version": 4,
+  "protocol_version": 5,
   "authority_owner": "yanhul/AIOS",
   "gateway_role": "external_effect_boundary",
   "effect_contract": {
     "required": [
       "effect_id",
+      "contract_id",
+      "actor",
       "action",
       "capability_ref",
       "authority_ref",
@@ -74,6 +76,13 @@
         "sender"
       ],
       "effect": "revoke_pending_and_authorized"
+    },
+    "RETRY_EFFECT": {
+      "args": [
+        "ticket",
+        "retry_permit"
+      ],
+      "effect": "verify_aios_retry_permit_and_issue_next_fenced_attempt"
     }
   },
   "normalized_identity": {
@@ -84,7 +93,8 @@
     "evidence_ref": "pre-effect evidence reference",
     "lineage_ref": "AIOS lineage reference",
     "idempotency_key": "effect deduplication identity",
-    "target_sha": "exact worker target revision"
+    "target_sha": "exact worker target revision",
+    "retry_permit": "AIOS-signed, one-time, exact prior receipt/reconciliation-bound retry authority"
   },
   "authorization": {
     "sender_identity_required": true,
@@ -102,7 +112,13 @@
     "begin_effect_is_idempotent": true,
     "replayed_begin_effect_may_execute": false,
     "attempt_and_receipt_history_durable": true,
-    "receipt_evidence_and_lineage_must_match_contract": true
+    "receipt_evidence_and_lineage_must_match_contract": true,
+    "retry_effect_requires_aios_ed25519_permit": true,
+    "retry_permit_binds_prior_attempt_fence_and_receipt_digest": true,
+    "retry_permit_requires_proven_not_submitted_reconciliation": true,
+    "retry_permit_nonce_single_use": true,
+    "retry_attempt_fence_strictly_increases": true,
+    "retry_effect_replay_is_non_executable": true
   },
   "protected_governance": [
     "policy",
@@ -117,7 +133,8 @@
     "gateway_does_not_hold_github_credentials": true,
     "gateway_does_not_execute_shell_commands": true,
     "gateway_does_not_modify_repository_code": true,
-    "worker_must_enforce_target_sha": true
+    "worker_must_enforce_target_sha": true,
+    "gateway_verifies_aios_retry_permit_public_key_only": true
   },
   "persistence": {
     "schema_version": 3,
@@ -126,6 +143,8 @@
     "append_only_hash_chained_events": true,
     "attempt_history": true,
     "receipt_history": true,
-    "legacy_v2_attempts_without_history": "fail_closed_reconciliation_required"
+    "legacy_v2_attempts_without_history": "fail_closed_reconciliation_required",
+    "retry_permit_history": true,
+    "consumed_retry_nonces": true
   }
 }
