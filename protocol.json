@@ -1,5 +1,5 @@
 {
-  "protocol_version": 3,
+  "protocol_version": 4,
   "authority_owner": "yanhul/AIOS",
   "gateway_role": "external_effect_boundary",
   "effect_contract": {
@@ -17,14 +17,64 @@
     "gateway_may_create_authority": false
   },
   "commands": {
-    "CREATE": {"args": ["ticket", "repository", "target_sha", "nonce", "ttl_seconds", "effect_contract"], "effect": "create_ticket"},
-    "SUA": {"args": ["ticket", "nonce", "sender", "target_sha"], "effect": "authorize_one_repair"},
-    "BOQUA": {"args": ["ticket", "sender"], "effect": "reject_repair"},
-    "RETRY": {"args": ["ticket", "sender"], "effect": "retry_verification_only"},
-    "BEGIN_EFFECT": {"args": ["ticket", "target_sha"], "effect": "issue_bound_attempt"},
-    "RECEIPT": {"args": ["ticket", "receipt"], "effect": "record_bound_receipt"},
-    "STATUS": {"args": [], "effect": "read_status"},
-    "STOP": {"args": ["sender"], "effect": "revoke_pending_and_authorized"}
+    "CREATE": {
+      "args": [
+        "ticket",
+        "repository",
+        "target_sha",
+        "nonce",
+        "ttl_seconds",
+        "effect_contract"
+      ],
+      "effect": "create_ticket"
+    },
+    "SUA": {
+      "args": [
+        "ticket",
+        "nonce",
+        "sender",
+        "target_sha"
+      ],
+      "effect": "authorize_one_repair"
+    },
+    "BOQUA": {
+      "args": [
+        "ticket",
+        "sender"
+      ],
+      "effect": "reject_repair"
+    },
+    "RETRY": {
+      "args": [
+        "ticket",
+        "sender"
+      ],
+      "effect": "retry_verification_only"
+    },
+    "BEGIN_EFFECT": {
+      "args": [
+        "ticket",
+        "target_sha"
+      ],
+      "effect": "issue_bound_attempt"
+    },
+    "RECEIPT": {
+      "args": [
+        "ticket",
+        "receipt"
+      ],
+      "effect": "record_bound_receipt"
+    },
+    "STATUS": {
+      "args": [],
+      "effect": "read_status"
+    },
+    "STOP": {
+      "args": [
+        "sender"
+      ],
+      "effect": "revoke_pending_and_authorized"
+    }
   },
   "normalized_identity": {
     "effect_id": "AIOS effect identity",
@@ -48,7 +98,11 @@
     "effect_requires_aios_contract": true,
     "receipt_must_bind_ticket_attempt_target_effect": true,
     "receipt_requires_evidence_and_lineage": true,
-    "stop_revokes_pending_and_authorized": true
+    "stop_revokes_pending_and_authorized": true,
+    "begin_effect_is_idempotent": true,
+    "replayed_begin_effect_may_execute": false,
+    "attempt_and_receipt_history_durable": true,
+    "receipt_evidence_and_lineage_must_match_contract": true
   },
   "protected_governance": [
     "policy",
@@ -64,5 +118,14 @@
     "gateway_does_not_execute_shell_commands": true,
     "gateway_does_not_modify_repository_code": true,
     "worker_must_enforce_target_sha": true
+  },
+  "persistence": {
+    "schema_version": 3,
+    "atomic_snapshot_replace": true,
+    "process_serialized_read_modify_write": true,
+    "append_only_hash_chained_events": true,
+    "attempt_history": true,
+    "receipt_history": true,
+    "legacy_v2_attempts_without_history": "fail_closed_reconciliation_required"
   }
 }

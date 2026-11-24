@@ -27,7 +27,7 @@ def main() -> int:
             req = json.loads(line)
             cmd = req.get("command")
             if cmd == "CREATE":
-                result = gateway.create_ticket(req["ticket"], req["repository"], req["target_sha"], req["nonce"], int(req["ttl_seconds"]))
+                result = gateway.create_ticket(req["ticket"], req["repository"], req["target_sha"], req["nonce"], int(req["ttl_seconds"]), req["effect_contract"])
                 out = {"ok": True, "ticket": result.__dict__}
             elif cmd == "SUA":
                 result = gateway.authorize(req["ticket"], req["nonce"], req["sender"], req["target_sha"])
