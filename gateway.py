@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import os
 import tempfile
 import time
@@ -17,10 +19,29 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+except ImportError:  # verification unavailable => all retry permits fail closed
+    InvalidSignature = Ed25519PublicKey = None
+
 TERMINAL = {"REJECTED", "COMPLETED", "FAILED", "EXPIRED"}
 PROTECTED = ("policy", "evidence_criteria", "promotion_criteria", "terminal_conditions", "trust_roots")
-CONTRACT_FIELDS = ("effect_id", "action", "capability_ref", "authority_ref", "evidence_ref", "lineage_ref", "idempotency_key")
+CONTRACT_FIELDS = ("effect_id", "contract_id", "actor", "action", "capability_ref", "authority_ref", "evidence_ref", "lineage_ref", "idempotency_key")
 RECEIPT_STATUSES = {"OBSERVED", "UNKNOWN", "FAILED", "COMPLETED"}
+RETRY_PERMIT_TYPE = "AIOS_GATEWAY_RETRY_PERMIT_V1"
+RETRY_PERMIT_FIELDS = (
+    "type", "permit_id", "key_id", "algorithm", "effect_id", "contract_id", "authority_ref",
+    "actor", "issuer", "retry_authorization_id", "ticket_id", "target_sha", "prior_gateway_attempt_id", "prior_fence",
+    "prior_gateway_receipt_digest", "operation_receipt_digest", "reconciliation_evidence_digest",
+    "reconciliation_outcome", "decision_id", "next_attempt_number", "next_attempt_id",
+    "next_fence", "nonce", "issued_at", "expires_at",
+)
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_HEX128 = re.compile(r"^[0-9a-f]{128}$")
+_RETRY_PERMIT_ID = re.compile(r"^GRP-[0-9a-f]{32}$")
+_MAX_RETRY_PERMIT_TTL = 900
+_CLOCK_SKEW = 60
 
 
 def sha256_text(value: str) -> str:
@@ -62,6 +83,7 @@ class Ticket:
     effect_contract: dict[str, str] | None = None
     attempt_history: list[dict] = field(default_factory=list)
     receipt_history: list[dict] = field(default_factory=list)
+    retry_permit_history: list[dict] = field(default_factory=list)
 
     @property
     def governance_digest(self) -> str:
@@ -127,7 +149,8 @@ class Gateway:
     silently allocates another attempt or replays an external effect.
     """
 
-    def __init__(self, path: str | Path, human_identity: str, governance: Mapping[str, str], now=time.time):
+    def __init__(self, path: str | Path, human_identity: str, governance: Mapping[str, str], now=time.time,
+                 retry_permit_public_keys: Mapping[str, str] | None = None):
         if not human_identity:
             raise ValueError("human_identity required")
         missing = [k for k in PROTECTED if not governance.get(k)]
@@ -136,6 +159,19 @@ class Gateway:
         self.path = Path(path)
         self.human_identity = human_identity
         self.governance = dict(governance)
+        if retry_permit_public_keys is None:
+            raw_keys = os.environ.get("AIOS_GATEWAY_RETRY_PUBLIC_KEYS", "")
+            try:
+                retry_permit_public_keys = json.loads(raw_keys) if raw_keys else {}
+            except ValueError as exc:
+                raise GatewayError("AIOS gateway retry public-key configuration is invalid JSON") from exc
+        if not isinstance(retry_permit_public_keys, Mapping):
+            raise GatewayError("AIOS gateway retry public-key registry must be a mapping")
+        self.retry_permit_public_keys = dict(retry_permit_public_keys)
+        for key_id, public_key in self.retry_permit_public_keys.items():
+            if (not isinstance(key_id, str) or not key_id.startswith("ed25519:")
+                    or not isinstance(public_key, str) or not re.fullmatch(r"[0-9a-f]{64}", public_key)):
+                raise GatewayError("AIOS gateway retry public-key entry is malformed")
         self._now = now
         self._data = self._load()
 
@@ -156,6 +192,7 @@ class Gateway:
             raw.setdefault("effect_contract", None)
             raw.setdefault("attempt_history", [])
             raw.setdefault("receipt_history", [])
+            raw.setdefault("retry_permit_history", [])
         data["version"] = 3
         return data
 
@@ -232,6 +269,7 @@ class Gateway:
         raw.setdefault("effect_contract", None)
         raw.setdefault("attempt_history", [])
         raw.setdefault("receipt_history", [])
+        raw.setdefault("retry_permit_history", [])
         return Ticket(**raw)
 
     def _check_governance(self, t: Ticket) -> None:
@@ -353,6 +391,147 @@ class Gateway:
                 "repository": t.repository, "target_sha": t.target_sha,
                 "governance_digest": t.governance_digest,
                 "replayed": False, "execute_allowed": True}
+
+    def _verify_retry_permit(self, permit: Mapping[str, object]) -> dict:
+        if not isinstance(permit, Mapping) or set(permit) != set(RETRY_PERMIT_FIELDS) | {"signature"}:
+            raise AuthorizationError("retry permit schema mismatch")
+        record = dict(permit)
+        if (record.get("type") != RETRY_PERMIT_TYPE or record.get("algorithm") != "Ed25519"
+                or not isinstance(record.get("permit_id"), str) or not _RETRY_PERMIT_ID.fullmatch(record["permit_id"])
+                or not isinstance(record.get("key_id"), str)
+                or not isinstance(record.get("signature"), str) or not _HEX128.fullmatch(record["signature"])):
+            raise AuthorizationError("retry permit identity/signature is malformed")
+        public_hex = self.retry_permit_public_keys.get(record["key_id"])
+        if public_hex is None:
+            raise AuthorizationError("retry permit signer is not pinned by Gateway")
+        if Ed25519PublicKey is None:
+            raise AuthorizationError("Ed25519 verification unavailable; retry permit rejected")
+        body = {key: record[key] for key in RETRY_PERMIT_FIELDS}
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex)).verify(
+                bytes.fromhex(record["signature"]), canonical_json(body).encode("utf-8"))
+        except (ValueError, InvalidSignature) as exc:
+            raise AuthorizationError("retry permit signature is invalid") from exc
+        for key in ("prior_gateway_receipt_digest", "operation_receipt_digest", "reconciliation_evidence_digest"):
+            if not isinstance(record.get(key), str) or not _HEX64.fullmatch(record[key]):
+                raise AuthorizationError(f"retry permit {key} is invalid")
+        for key in ("effect_id", "contract_id", "authority_ref", "actor", "issuer", "retry_authorization_id",
+                    "ticket_id", "target_sha", "prior_gateway_attempt_id", "decision_id", "next_attempt_id", "nonce"):
+            if not isinstance(record.get(key), str) or not record[key].strip():
+                raise AuthorizationError(f"retry permit {key} is missing")
+        for key in ("prior_fence", "next_attempt_number", "next_fence"):
+            value = record.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise AuthorizationError(f"retry permit {key} is invalid")
+        for key in ("issued_at", "expires_at"):
+            value = record.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise AuthorizationError("retry permit validity window is invalid")
+        if (record["expires_at"] <= record["issued_at"]
+                or record["expires_at"] - record["issued_at"] > _MAX_RETRY_PERMIT_TTL):
+            raise AuthorizationError("retry permit validity window is invalid")
+        now = self._now()
+        if now > record["expires_at"] or record["issued_at"] > now + _CLOCK_SKEW:
+            raise AuthorizationError("retry permit is expired or issued in the future")
+        if not re.fullmatch(r"RA-[0-9a-f]{32}", record["retry_authorization_id"]):
+            raise AuthorizationError("retry permit AIOS retry-authorization binding is malformed")
+        if record.get("reconciliation_outcome") != "PROVEN_NOT_SUBMITTED":
+            raise AuthorizationError("retry permit lacks proven non-submission reconciliation")
+        return record
+
+    @_serialized
+    def retry_effect(self, ticket_id: str, permit: Mapping[str, object]) -> dict[str, object]:
+        """Consume one AIOS-signed permit and allocate the next fenced attempt.
+
+        An exact replay returns the already allocated attempt with execute_allowed=False.
+        Gateway verifies the AIOS signature but never creates retry authority itself.
+        """
+        t = self._ticket(ticket_id)
+        record = self._verify_retry_permit(permit)
+        raw = self._data["tickets"][ticket_id]
+        contract = _require_contract(t.effect_contract or {})
+        digest = sha256_text(canonical_json(record))
+        history = raw.setdefault("retry_permit_history", [])
+        consumed = next((item for item in history if item.get("permit_id") == record["permit_id"]), None)
+        if consumed is not None:
+            if consumed.get("permit_digest") != digest:
+                raise AuthorizationError("retry permit id replayed with different content")
+            attempt = next((item for item in raw.get("attempt_history", [])
+                            if item.get("attempt_id") == consumed.get("attempt_id")), None)
+            if attempt is None:
+                raise GatewayError("consumed retry permit has no durable attempt")
+            return {**contract, **attempt, "ticket_id": ticket_id,
+                    "repository": t.repository, "target_sha": t.target_sha,
+                    "governance_digest": t.governance_digest,
+                    "retry_permit_id": record["permit_id"], "replayed": True, "execute_allowed": False}
+
+        if self._data.get("revoked") or t.state not in {"AUTHORIZED", "FAILED"}:
+            raise AuthorizationError("retry requires a live authorized/failed ticket")
+        self._check_governance(t)
+        if self._now() >= t.expires_at:
+            self._transition(ticket_id, "EXPIRED", "TICKET_EXPIRED")
+            raise AuthorizationError("ticket expired")
+        attempts = raw.get("attempt_history", [])
+        receipts = raw.get("receipt_history", [])
+        if not attempts or not receipts:
+            raise AuthorizationError("retry requires a durable prior attempt and receipt")
+        prior = attempts[-1]
+        prior_receipt = next((item for item in reversed(receipts)
+                              if item.get("receipt", {}).get("attempt_id") == prior.get("attempt_id")), None)
+        if prior_receipt is None:
+            raise AuthorizationError("retry prior attempt has no durable receipt")
+        expected = {
+            "effect_id": contract["effect_id"], "contract_id": contract["contract_id"],
+            "authority_ref": contract["authority_ref"], "actor": contract["actor"],
+            "ticket_id": ticket_id, "target_sha": t.target_sha,
+            "prior_gateway_attempt_id": prior.get("attempt_id"),
+            "prior_fence": prior.get("fence"),
+            "prior_gateway_receipt_digest": prior_receipt.get("digest"),
+            "next_attempt_number": int(raw.get("attempts", 0)) + 1,
+            "next_attempt_id": f"{ticket_id}:{int(raw.get('attempts', 0)) + 1}",
+            "next_fence": int(prior.get("fence", 0)) + 1,
+        }
+        for key, value in expected.items():
+            if record.get(key) != value:
+                raise AuthorizationError(f"retry permit {key} binding mismatch")
+        if prior.get("status") not in {"UNKNOWN", "FAILED"}:
+            raise AuthorizationError("retry prior attempt is not unresolved/rejected")
+        nonce = record["nonce"]
+        for other in self._data.get("consumed_retry_nonces", []):
+            if other == nonce:
+                raise AuthorizationError("retry permit nonce already consumed")
+        attempt = {
+            "attempt_id": record["next_attempt_id"],
+            "attempt_number": record["next_attempt_number"],
+            "fence": record["next_fence"],
+            "effect_id": contract["effect_id"],
+            "idempotency_key": contract["idempotency_key"],
+            "target_sha": t.target_sha,
+            "status": "DISPATCHED",
+            "started_at": self._now(),
+            "retry_permit_id": record["permit_id"],
+            "prior_attempt_id": prior["attempt_id"],
+            "prior_receipt_digest": prior_receipt["digest"],
+        }
+        raw["attempts"] = record["next_attempt_number"]
+        raw["attempt_history"].append(attempt)
+        history.append({"permit_id": record["permit_id"], "permit_digest": digest,
+                        "nonce": nonce, "attempt_id": attempt["attempt_id"],
+                        "consumed_at": self._now()})
+        self._data.setdefault("consumed_retry_nonces", []).append(nonce)
+        raw["state"] = "AUTHORIZED"
+        self._append_event("RETRY_PERMIT_CONSUMED", ticket_id, {
+            "permit_id": record["permit_id"], "permit_digest": digest,
+            "operation_receipt_digest": record["operation_receipt_digest"],
+            "reconciliation_evidence_digest": record["reconciliation_evidence_digest"],
+            "attempt_id": attempt["attempt_id"], "fence": attempt["fence"],
+        })
+        self._append_event("EFFECT_ATTEMPT_DISPATCHED", ticket_id, attempt)
+        self._save()
+        return {**contract, **attempt, "ticket_id": ticket_id,
+                "repository": t.repository, "target_sha": t.target_sha,
+                "governance_digest": t.governance_digest,
+                "retry_permit_id": record["permit_id"], "replayed": False, "execute_allowed": True}
 
     @_serialized
     def record_receipt(self, ticket_id: str, receipt: Mapping[str, object]) -> Ticket:

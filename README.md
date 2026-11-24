@@ -21,11 +21,13 @@ AIOS CONTROL PLANE
 
 AIOS remains the authority owner. Repository adapters remain responsible for their domain evidence/workload semantics. The gateway prevents a repair effect from crossing the boundary without an explicit, bound authorization.
 
-## Effect contract v4
+## Effect contract v5
 
 `CREATE` persists the AIOS-supplied effect contract. The gateway requires these fields before `BEGIN_EFFECT` can cross the external boundary:
 
 - `effect_id`
+- `contract_id`
+- `actor`
 - `action`
 - `capability_ref`
 - `authority_ref`
@@ -61,10 +63,11 @@ The gateway never creates authority or capability records. It only binds them to
 - `BEGIN_EFFECT` — issue one bound attempt after authorization; idempotent replays return the same attempt but cannot execute it again.
 - `RECEIPT` — persist the worker's bound result.
 - `RETRY` — verification-only retry; it does not authorize code changes.
+- `RETRY_EFFECT` — consume a signed AIOS retry permit to allocate one new monotonic, fenced attempt; exact replays are non-executable.
 - `STATUS` — inspect persisted state.
 - `STOP` — revoke pending and authorized work.
 
-The canonical machine-readable contract is `protocol.json` (v4).
+The canonical machine-readable contract is `protocol.json` (v5).
 
 ## Transport
 
@@ -79,3 +82,5 @@ python -m unittest -v test_gateway.py
 ```
 
 The tests cover sender/target mismatch, nonce replay, governance mutation, expiry, AIOS contract binding, durable attempt/receipt history, hash-chain integrity, concurrent idempotency, stale legacy state, receipt binding, and emergency stop.
+
+Gateway retry-permit verification requires the `cryptography` package and a pinned public-key map in `AIOS_GATEWAY_RETRY_PUBLIC_KEYS`. Example shape: `{"ed25519:<key-id>": "<32-byte-public-key-hex>"}`. Only the public key is configured here; the AIOS signing private key must remain outside Gateway.
