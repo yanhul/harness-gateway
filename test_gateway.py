@@ -1,5 +1,10 @@
 import tempfile
 import unittest
+import hashlib
+import time
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pathlib import Path
 
 from gateway import AuthorizationError, Gateway, GatewayError
@@ -7,6 +12,8 @@ from gateway import AuthorizationError, Gateway, GatewayError
 GOV = {k: f"digest-{k}" for k in ("policy", "evidence_criteria", "promotion_criteria", "terminal_conditions", "trust_roots")}
 CONTRACT = {
     "effect_id": "E1",
+    "contract_id": "C1",
+    "actor": "aios",
     "action": "repair",
     "capability_ref": "capability:repo-repair@1",
     "authority_ref": "aios:permit:P1",
@@ -20,6 +27,32 @@ class Clock:
     value = 1000.0
     def __call__(self):
         return self.value
+
+
+def _retry_keypair():
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key_id = "ed25519:" + hashlib.sha256(public).hexdigest()[:32]
+    return private, key_id, public.hex()
+
+
+def _signed_retry_permit(private, key_id, *, prior_receipt_digest, **overrides):
+    now = 1000.0
+    body = {
+        "type": "AIOS_GATEWAY_RETRY_PERMIT_V1", "permit_id": "GRP-" + "a" * 32,
+        "key_id": key_id, "algorithm": "Ed25519", "effect_id": "E1", "contract_id": "C1",
+        "authority_ref": "aios:permit:P1", "actor": "aios", "issuer": "operator:human",
+        "retry_authorization_id": "RA-" + "d" * 32, "ticket_id": "T1", "target_sha": "abc123",
+        "prior_gateway_attempt_id": "T1:1", "prior_fence": 1,
+        "prior_gateway_receipt_digest": prior_receipt_digest,
+        "operation_receipt_digest": "b" * 64, "reconciliation_evidence_digest": "c" * 64,
+        "reconciliation_outcome": "PROVEN_NOT_SUBMITTED", "decision_id": "DEC-RETRY-1",
+        "next_attempt_number": 2, "next_attempt_id": "T1:2", "next_fence": 2,
+        "nonce": "nonce-retry-1", "issued_at": now, "expires_at": now + 300,
+    }
+    body.update(overrides)
+    signature = private.sign(__import__("gateway").canonical_json(body).encode()).hex()
+    return {**body, "signature": signature}
 
 
 class GatewayTests(unittest.TestCase):
@@ -226,6 +259,148 @@ class GatewayTests(unittest.TestCase):
         result = json.loads(completed.stdout.strip())
         self.assertTrue(result["ok"])
         self.assertEqual(result["ticket"]["effect_contract"], CONTRACT)
+
+
+    def _unknown_prior(self):
+        self.g.authorize("T1", "N1", "+84999", "abc123")
+        first = self.g.begin_effect("T1", "abc123")
+        receipt = {
+            "ticket_id": "T1", "attempt_id": first["attempt_id"], "attempt_fence": first["fence"],
+            "target_sha": "abc123", "effect_id": "E1", "status": "UNKNOWN",
+            "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"],
+        }
+        self.g.record_receipt("T1", receipt)
+        digest = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        return first, digest
+
+    def _retry_gateway(self):
+        private, key_id, public = _retry_keypair()
+        self.g = Gateway(self.g.path, "+84999", GOV, self.clock, {key_id: public})
+        return private, key_id
+
+    def test_retry_effect_requires_signed_aios_permit_and_proven_non_submission(self):
+        self._unknown_prior()
+        private, key_id = self._retry_gateway()
+        with self.assertRaisesRegex(AuthorizationError, "schema mismatch"):
+            self.g.retry_effect("T1", {})
+        permit = _signed_retry_permit(private, key_id, prior_receipt_digest=self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"])
+        result = self.g.retry_effect("T1", permit)
+        self.assertEqual(result["attempt_id"], "T1:2")
+        self.assertEqual(result["fence"], 2)
+        self.assertTrue(result["execute_allowed"])
+        self.assertFalse(result["replayed"])
+
+    def test_retry_effect_exact_replay_is_non_executable_after_restart(self):
+        self._unknown_prior()
+        private, key_id = self._retry_gateway()
+        permit = _signed_retry_permit(private, key_id, prior_receipt_digest=self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"])
+        first = self.g.retry_effect("T1", permit)
+        reopened = Gateway(self.g.path, "+84999", GOV, self.clock, self.g.retry_permit_public_keys)
+        replay = reopened.retry_effect("T1", permit)
+        self.assertEqual(first["attempt_id"], replay["attempt_id"])
+        self.assertEqual(replay["fence"], first["fence"])
+        self.assertTrue(replay["replayed"])
+        self.assertFalse(replay["execute_allowed"])
+        self.assertEqual(reopened.status()["tickets"]["T1"]["attempts"], 2)
+
+    def test_retry_effect_rejects_tampered_signature_and_stale_receipt(self):
+        self._unknown_prior()
+        private, key_id = self._retry_gateway()
+        digest = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        permit = _signed_retry_permit(private, key_id, prior_receipt_digest=digest)
+        tampered = dict(permit, actor="agent:attacker")
+        with self.assertRaisesRegex(AuthorizationError, "signature is invalid"):
+            self.g.retry_effect("T1", tampered)
+        stale = _signed_retry_permit(private, key_id, prior_receipt_digest="d" * 64)
+        with self.assertRaisesRegex(AuthorizationError, "prior_gateway_receipt_digest"):
+            self.g.retry_effect("T1", stale)
+
+    def test_retry_effect_requires_pinned_signer_and_unexpired_permit(self):
+        self._unknown_prior()
+        private, key_id = self._retry_gateway()
+        digest = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        permit = _signed_retry_permit(private, key_id, prior_receipt_digest=digest)
+        unpinned = Gateway(self.g.path, "+84999", GOV, self.clock, {})
+        with self.assertRaisesRegex(AuthorizationError, "signer is not pinned"):
+            unpinned.retry_effect("T1", permit)
+        expired = _signed_retry_permit(
+            private, key_id, prior_receipt_digest=digest,
+            permit_id="GRP-" + "9" * 32, nonce="expired-nonce",
+            issued_at=100.0, expires_at=200.0,
+        )
+        with self.assertRaisesRegex(AuthorizationError, "expired or issued in the future"):
+            self.g.retry_effect("T1", expired)
+
+    def test_retry_effect_rejects_completed_prior_attempt_even_with_aios_signature(self):
+        self.g.authorize("T1", "N1", "+84999", "abc123")
+        first = self.g.begin_effect("T1", "abc123")
+        completed = {
+            "ticket_id": "T1", "attempt_id": first["attempt_id"], "attempt_fence": first["fence"],
+            "target_sha": "abc123", "effect_id": "E1", "status": "COMPLETED",
+            "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"],
+        }
+        self.g.record_receipt("T1", completed)
+        private, key_id, public = _retry_keypair()
+        self.g = Gateway(self.g.path, "+84999", GOV, self.clock, {key_id: public})
+        digest = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        permit = _signed_retry_permit(private, key_id, prior_receipt_digest=digest)
+        with self.assertRaisesRegex(AuthorizationError, "retry requires a live authorized/failed ticket"):
+            self.g.retry_effect("T1", permit)
+
+    def test_retry_effect_rejects_unknown_without_proven_non_submission(self):
+        self._unknown_prior()
+        private, key_id = self._retry_gateway()
+        digest = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        permit = _signed_retry_permit(private, key_id, prior_receipt_digest=digest,
+                                      reconciliation_outcome="UNKNOWN")
+        with self.assertRaisesRegex(AuthorizationError, "proven non-submission"):
+            self.g.retry_effect("T1", permit)
+        self.assertEqual(self.g.status()["tickets"]["T1"]["attempts"], 1)
+
+    def test_retry_fence_increases_monotonically_for_next_permit(self):
+        self._unknown_prior()
+        private, key_id = self._retry_gateway()
+        digest1 = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        permit1 = _signed_retry_permit(private, key_id, prior_receipt_digest=digest1)
+        attempt2 = self.g.retry_effect("T1", permit1)
+        receipt2 = {
+            "ticket_id": "T1", "attempt_id": attempt2["attempt_id"], "attempt_fence": attempt2["fence"],
+            "target_sha": "abc123", "effect_id": "E1", "status": "UNKNOWN",
+            "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"],
+        }
+        self.g.record_receipt("T1", receipt2)
+        digest2 = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        permit2 = _signed_retry_permit(
+            private, key_id, prior_receipt_digest=digest2,
+            permit_id="GRP-" + "e" * 32, prior_gateway_attempt_id="T1:2", prior_fence=2,
+            next_attempt_number=3, next_attempt_id="T1:3", next_fence=3,
+            nonce="nonce-retry-2", decision_id="DEC-RETRY-2",
+        )
+        attempt3 = self.g.retry_effect("T1", permit2)
+        self.assertEqual(attempt3["attempt_id"], "T1:3")
+        self.assertEqual(attempt3["fence"], 3)
+
+    def test_retry_permit_nonce_cannot_be_reused_for_another_ticket(self):
+        self._unknown_prior()
+        private, key_id = self._retry_gateway()
+        digest = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        permit = _signed_retry_permit(private, key_id, prior_receipt_digest=digest)
+        first = self.g.retry_effect("T1", permit)
+        receipt2 = {
+            "ticket_id": "T1", "attempt_id": first["attempt_id"], "attempt_fence": first["fence"],
+            "target_sha": "abc123", "effect_id": "E1", "status": "UNKNOWN",
+            "evidence_ref": CONTRACT["evidence_ref"], "lineage_ref": CONTRACT["lineage_ref"],
+        }
+        self.g.record_receipt("T1", receipt2)
+        digest2 = self.g.status()["tickets"]["T1"]["receipt_history"][-1]["digest"]
+        reused_nonce = _signed_retry_permit(
+            private, key_id, prior_receipt_digest=digest2,
+            permit_id="GRP-" + "f" * 32, prior_gateway_attempt_id="T1:2", prior_fence=2,
+            next_attempt_number=3, next_attempt_id="T1:3", next_fence=3,
+            decision_id="DEC-RETRY-3",
+        )
+        with self.assertRaisesRegex(AuthorizationError, "nonce already consumed"):
+            self.g.retry_effect("T1", reused_nonce)
 
 
 if __name__ == "__main__":

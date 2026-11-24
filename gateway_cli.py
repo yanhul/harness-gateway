@@ -41,6 +41,8 @@ def main() -> int:
                 out = {"ok": True}
             elif cmd == "BEGIN_EFFECT":
                 out = {"ok": True, "effect": gateway.begin_effect(req["ticket"], req["target_sha"])}
+            elif cmd == "RETRY_EFFECT":
+                out = {"ok": True, "effect": gateway.retry_effect(req["ticket"], req["retry_permit"])}
             elif cmd == "RECEIPT":
                 out = {"ok": True, "ticket": gateway.record_receipt(req["ticket"], req["receipt"]).__dict__}
             elif cmd == "STATUS":
